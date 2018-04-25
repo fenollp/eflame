@@ -9,6 +9,7 @@
 
 -define(DEFAULT_MODE, normal_with_children).
 -define(DEFAULT_OUTPUT_FILE, "stacks.out").
+-define(FILE_OPTIONS, [exclusive, write, append, delayed_write]).
 
 apply(F, A) ->
     apply1(?DEFAULT_MODE, ?DEFAULT_OUTPUT_FILE, {F, A}).
@@ -23,13 +24,14 @@ apply(Mode, OutputFile, M, F, A) ->
     apply1(Mode, OutputFile, {{M, F}, A}).
 
 apply1(Mode, OutputFile, {Fun, Args}) ->
-    Tracer = spawn_tracer(),
+    {ok,Dev} = file:open(OutputFile, ?FILE_OPTIONS),
+    Tracer = spawn_tracer(Dev),
 
     start_trace(Tracer, self(), Mode),
     Return = (catch apply_fun(Fun, Args)),
-    {ok, Bytes} = stop_trace(Tracer, self()),
+    stop_trace(Tracer, self()),
 
-    ok = file:write_file(OutputFile, Bytes),
+    ok = file:close(Dev),
     Return.
 
 apply_fun({M, F}, A) ->
@@ -46,16 +48,9 @@ start_trace(Tracer, Target, Mode) ->
 
 stop_trace(Tracer, Target) ->
     erlang:trace(Target, false, [all]),
-    Tracer ! {dump_bytes, self()},
+    true = exit(Tracer, normal).
 
-    Ret = receive {bytes, B} -> {ok, B}
-    after 5000 -> {error, timeout}
-    end,
-
-    exit(Tracer, normal),
-    Ret.
-
-spawn_tracer() -> spawn(fun() -> trace_listener(dict:new()) end).
+spawn_tracer(Dev) -> spawn(fun() -> trace_listener(Dev, dict:new()) end).
 
 trace_flags(normal) ->
     [call, arity, return_to, timestamp, running];
@@ -64,14 +59,14 @@ trace_flags(normal_with_children) ->
 trace_flags(like_fprof) -> % fprof does this as 'normal', will not work!
     [call, return_to, running, procs, garbage_collection, arity, timestamp, set_on_spawn].
 
-trace_listener(State) ->
+trace_listener(Dev, State) ->
     receive
-        {dump, Pid} ->
+        _M={dump, Pid} ->
             Pid ! {stacks, dict:to_list(State)};
-        {dump_bytes, Pid} ->
+        _M={dump_bytes, Pid} ->
             Bytes = iolist_to_binary([dump_to_iolist(TPid, Dump) || {TPid, [Dump]} <- dict:to_list(State)]),
             Pid ! {bytes, Bytes};
-        Term ->
+        _M=Term ->
             trace_ts = element(1, Term),
             PidS = element(2, Term),
 
@@ -81,10 +76,15 @@ trace_listener(State) ->
             end,
 
             NewPidState = trace_proc_stream(Term, PidState),
+            case PidState =:= NewPidState of
+                true -> ok;
+                false ->
+                    io:format(user, "\nNewPidState\n  ~p\nPidState\n  ~p\n", [NewPidState,PidState])
+            end,
 
             D1 = dict:erase(PidS, State),
             D2 = dict:append(PidS, NewPidState, D1),
-            trace_listener(D2)
+            trace_listener(Dev, D2)
     end.
 
 us({Mega, Secs, Micro}) ->
